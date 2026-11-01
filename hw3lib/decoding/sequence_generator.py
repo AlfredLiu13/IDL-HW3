@@ -165,7 +165,33 @@ class SequenceGenerator:
             raise ValueError("max_length must be >= input sequence length")
         
         # TODO: Implement greedy search
-        raise NotImplementedError # Remove once implemented
+        batch_size = x.size(0)
+        scores   = torch.zeros(batch_size, device=x.device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
+
+        for _ in range(self.max_length - x.size(1)):
+            # Stop early once every sequence has produced EOS
+            if finished.all():
+                break
+
+            # Next-token logits -> penalty -> temperature -> log-probabilities
+            next_scores = self.score_fn(x)                                    # (batch_size, vocab_size)
+            next_scores = self._apply_repeat_penalty(next_scores, x, repeat_penalty)
+            next_scores = next_scores / temperature
+            log_probs   = torch.log_softmax(next_scores, dim=-1)
+
+            # Greedy choice: the single most likely token
+            next_tokens  = log_probs.argmax(dim=-1)                           # (batch_size,)
+            token_scores = log_probs.gather(1, next_tokens.unsqueeze(1)).squeeze(1)
+
+            # Finished sequences stop accumulating score
+            scores = torch.where(finished, scores, scores + token_scores)
+
+            # Append and update EOS flags
+            x = torch.cat([x, next_tokens.unsqueeze(1)], dim=1)               # (batch_size, seq_len + 1)
+            finished = finished | (next_tokens == self.tokenizer.eos_id)
+
+        return x, scores
 
     def generate_beam(
             self,
@@ -197,7 +223,60 @@ class SequenceGenerator:
             raise ValueError("max_length must be >= input sequence length")
         
         # TODO: Implement beam search
-        raise NotImplementedError # Remove once implemented
+        batch_size = x.size(0)
+        eos_id = self.tokenizer.eos_id
+
+        # First step: expand the single prompt into beam_width beams
+        logits = self.score_fn(x)                                             # (B, V)
+        logits = self._apply_repeat_penalty(logits, x, repeat_penalty)
+        logits = logits / temperature
+        log_probs = torch.log_softmax(logits, dim=-1)
+
+        scores, next_tokens = torch.topk(log_probs, beam_width, dim=-1)       # (B, W), (B, W)
+        x = x.unsqueeze(1).expand(-1, beam_width, -1)                         # (B, W, L)
+        x = torch.cat([x, next_tokens.unsqueeze(-1)], dim=-1)                 # (B, W, L+1)
+        finished = next_tokens == eos_id                                      # (B, W)
+
+        # Remaining steps
+        for _ in range(self.max_length - x.size(-1)):
+            if finished.all():
+                break
+
+            # Score every beam: score_fn takes (B, L) and returns (B, V)
+            next_token_scores = torch.stack(
+                [self.score_fn(x[:, b, :]) for b in range(beam_width)], dim=1
+            )                                                                 # (B, W, V)
+            next_token_scores = self._apply_repeat_penalty(next_token_scores, x, repeat_penalty)
+            next_token_scores = next_token_scores / temperature
+            next_token_scores = torch.log_softmax(next_token_scores, dim=-1)
+            vocab_size = next_token_scores.size(-1)
+
+            # A finished beam may only "extend" with EOS at zero cost, so its score is
+            # frozen and it occupies exactly one candidate slot (no duplicates)
+            if finished.any():
+                eos_only = torch.full((vocab_size,), float('-inf'), device=x.device,
+                                      dtype=next_token_scores.dtype)
+                eos_only[eos_id] = 0.0
+                next_token_scores = torch.where(finished.unsqueeze(-1), eos_only, next_token_scores)
+
+            # Cumulative score of every (beam, token) extension
+            cum_scores = scores.unsqueeze(-1) + next_token_scores             # (B, W, V)
+            cum_scores = cum_scores.view(batch_size, -1)                      # (B, W*V)
+
+            # Keep the best beam_width extensions across all beams
+            scores, indices = torch.topk(cum_scores, beam_width, dim=-1)      # (B, W)
+            beam_indices = indices // vocab_size                              # which beam it extends
+            next_tokens  = indices % vocab_size                               # which token it adds
+
+            # Reorder the histories so each new token is appended to its parent beam
+            x = torch.gather(x, 1, beam_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)))
+            finished = torch.gather(finished, 1, beam_indices) | (next_tokens == eos_id)
+            x = torch.cat([x, next_tokens.unsqueeze(-1)], dim=-1)             # (B, W, L+1)
+
+        # Sort the beams in each batch item by descending score
+        scores, order = torch.sort(scores, dim=-1, descending=True)
+        x = torch.gather(x, 1, order.unsqueeze(-1).expand(-1, -1, x.size(-1)))
+        return x, scores
 
     def generate_sample(
             self,
