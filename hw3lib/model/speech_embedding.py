@@ -188,15 +188,20 @@ class Conv2DSubsampling(torch.nn.Module):
         
         self.kernel_size = kernel_size
         self.time_stride1, self.time_stride2 = self.closest_factors(time_reduction)
+        # Also stride by 2 along frequency in each conv (80 -> 39 -> 19 bins), as in the
+        # standard Conv2dSubsampling front end. This leaves the time reduction unchanged but
+        # shrinks the flattened input of linear_out ~4x (~5.0M -> ~1.2M params at d_model=256),
+        # and cuts the conv activation memory, freeing budget for encoder depth.
+        self.freq_stride = 2
 
         self.conv = torch.nn.Sequential(
-            torch.nn.Conv2d(1, output_dim, kernel_size=3, stride=(self.time_stride1, 1)),
+            torch.nn.Conv2d(1, output_dim, kernel_size=3, stride=(self.time_stride1, self.freq_stride)),
             torch.nn.GELU(),
-            torch.nn.Conv2d(output_dim, output_dim, kernel_size=3, stride=(self.time_stride2, 1)),
+            torch.nn.Conv2d(output_dim, output_dim, kernel_size=3, stride=(self.time_stride2, self.freq_stride)),
             torch.nn.GELU(),
         )
 
-        linear_in_dim = self.calculate_downsampled_length(input_dim, 1, 1)
+        linear_in_dim = self.calculate_downsampled_length(input_dim, self.freq_stride, self.freq_stride)
         linear_in_dim *= output_dim
         # TODO: Replace the Linear layer with adaptive pooling and test the performance
         # self.freq_pool = torch.nn.AdaptiveAvgPool2d((None, 1))  # Pool across frequency only

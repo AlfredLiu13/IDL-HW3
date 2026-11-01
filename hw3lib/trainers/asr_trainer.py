@@ -300,6 +300,8 @@ class ASRTrainer(BaseTrainer):
             
             # Save checkpoints
             self.save_checkpoint('checkpoint-last-epoch-model.pth')
+            # Model-only weights for checkpoint averaging (rolling window, local only)
+            self._save_averaging_weights(epoch)
             
             # Check if this is the best model
             if val_metrics['cer'] < best_val_cer:
@@ -402,7 +404,7 @@ class ASRTrainer(BaseTrainer):
                 # targets_golden is None for the test set; it is only used for decoding text, so it can stay on the CPU
                 
                 # TODO: Encode speech features to hidden states
-                encoder_output, pad_mask_src, _, _ = self.model.encode(feats, feat_lengths)
+                encoder_output, pad_mask_src, _, ctc_inputs = self.model.encode(feats, feat_lengths)
                 
                 # Define scoring function for this batch
                 def get_score(x):
@@ -424,9 +426,12 @@ class ASRTrainer(BaseTrainer):
                         temperature=recognition_config['temperature'],
                         repeat_penalty=recognition_config['repeat_penalty']
                     )
-                    # Pick best beam
-                    seqs = seqs[:, 0, :]
-                    scores = scores[:, 0]
+                    # Rescore the beams with length normalization and (optionally) CTC, then pick the best
+                    seqs, scores = self._rescore_beams(
+                        seqs, scores, ctc_inputs,
+                        ctc_weight=recognition_config.get('ctc_weight', 0.0),
+                        length_penalty=recognition_config.get('length_penalty', 0.0)
+                    )
                 else:
                     # TODO: Generate sequences using greedy search
                     seqs, scores = generator.generate_greedy(
@@ -436,7 +441,7 @@ class ASRTrainer(BaseTrainer):
                     )
 
                 # Clean up
-                del feats, feat_lengths, encoder_output, pad_mask_src, prompts
+                del feats, feat_lengths, encoder_output, pad_mask_src, prompts, ctc_inputs
                 torch.cuda.empty_cache()
 
                 # Post process sequences
@@ -484,14 +489,19 @@ class ASRTrainer(BaseTrainer):
             'beam_width': 1,
         })
 
+        # Tune these two on the dev set (see tune_rescoring below)
         beam_10_config = common_config.copy()
         beam_10_config.update({
             'beam_width': 10,
+            'ctc_weight': 0.3,
+            'length_penalty': 0.6,
         })
         
         beam_20_config = common_config.copy()
         beam_20_config.update({
             'beam_width': 20,
+            'ctc_weight': 0.3,
+            'length_penalty': 0.6,
         })
         
         return {
@@ -526,6 +536,108 @@ class ASRTrainer(BaseTrainer):
             'cer': cer.item() * 100
         }
     
+    # ---------------------------------------------------------------------------------------------
+    # Additions: beam rescoring, checkpoint averaging, rescoring-weight tuning
+    # ---------------------------------------------------------------------------------------------
+    def _rescore_beams(self, seqs: torch.Tensor, att_scores: torch.Tensor, ctc_inputs: dict,
+                       ctc_weight: float = 0.0, length_penalty: float = 0.0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pick the best beam using a combination of the attention score, the CTC score and a
+        length normalization:  score = ((1 - w) * att + w * ctc) / len ** length_penalty
+
+        Args:
+            seqs:       (B, W, L) beam hypotheses, starting with SOS
+            att_scores: (B, W) summed attention log-probabilities from generate_beam
+            ctc_inputs: dict from model.encode with 'log_probs' (T', B, C) and 'lengths' (B,)
+            ctc_weight: weight of the CTC score in [0, 1]; 0 disables CTC rescoring
+            length_penalty: exponent alpha of the length normalization; 0 disables it
+        Returns:
+            best_seqs (B, L) and their combined scores (B,)
+        """
+        B, W, L = seqs.shape
+        eos_id = self.tokenizer.eos_id
+
+        # Hypothesis tokens without SOS, kept up to and including the first EOS
+        # (CTC was trained on the golden targets, which end with EOS)
+        hyps = seqs[:, :, 1:].reshape(B * W, L - 1)                          # (B*W, L-1)
+        is_eos = hyps == eos_id
+        has_eos = is_eos.any(dim=1)
+        first_eos = is_eos.float().argmax(dim=1)
+        hyp_lengths = torch.where(has_eos, first_eos + 1,
+                                  torch.full_like(first_eos, L - 1)).clamp(min=1)  # (B*W,)
+
+        combined = att_scores.reshape(B * W).float()
+
+        if ctc_weight > 0:
+            log_probs = ctc_inputs['log_probs'].float()                       # (T', B, C)
+            log_probs = log_probs.repeat_interleave(W, dim=1)                 # (T', B*W, C)
+            input_lengths = ctc_inputs['lengths'].repeat_interleave(W)        # (B*W,)
+            ctc_nll = F.ctc_loss(
+                log_probs, hyps, input_lengths, hyp_lengths,
+                blank=self.tokenizer.pad_id, reduction='none', zero_infinity=False
+            )
+            # Impossible alignments come out as inf; give them a large penalty instead
+            # (zero_infinity=True would set them to 0, i.e. the BEST possible score)
+            ctc_nll = torch.nan_to_num(ctc_nll, nan=1e4, posinf=1e4)
+            combined = (1.0 - ctc_weight) * combined + ctc_weight * (-ctc_nll)
+
+        if length_penalty > 0:
+            combined = combined / hyp_lengths.float().pow(length_penalty)
+
+        combined = combined.reshape(B, W)
+        best = combined.argmax(dim=1)                                         # (B,)
+        batch_idx = torch.arange(B, device=seqs.device)
+        return seqs[batch_idx, best], combined[batch_idx, best]
+
+    def _save_averaging_weights(self, epoch: int, keep: int = 10) -> None:
+        """Save model-only weights for this epoch, keeping only the most recent `keep` files."""
+        avg_dir = self.checkpoint_dir / 'averaging'
+        avg_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self.model.state_dict(), avg_dir / f'epoch-{epoch:04d}.pth')
+        files = sorted(avg_dir.glob('epoch-*.pth'))
+        for old in files[:-keep]:
+            old.unlink()
+
+    def average_recent_checkpoints(self, n: int = 10) -> List[str]:
+        """
+        Load the average of the last n saved epoch weights into self.model.
+        Call this after training, before evaluate().
+        """
+        files = sorted((self.checkpoint_dir / 'averaging').glob('epoch-*.pth'))[-n:]
+        if not files:
+            raise FileNotFoundError("No per-epoch weights found to average")
+        avg_state = None
+        for f in files:
+            state = torch.load(f, map_location='cpu')
+            if avg_state is None:
+                avg_state = {k: v.clone().double() if v.is_floating_point() else v.clone()
+                             for k, v in state.items()}
+            else:
+                for k, v in state.items():
+                    if v.is_floating_point():
+                        avg_state[k] += v.double()
+        for k, v in avg_state.items():
+            if v.is_floating_point():
+                avg_state[k] = (v / len(files)).to(state[k].dtype)
+        self.model.load_state_dict(avg_state)
+        print(f"Averaged {len(files)} checkpoints: {[f.name for f in files]}")
+        return [str(f) for f in files]
+
+    def tune_rescoring(self, dataloader, beam_width: int = 10, num_batches: Optional[int] = 20,
+                       ctc_weights=(0.0, 0.2, 0.3, 0.5), length_penalties=(0.0, 0.6, 1.0)) -> pd.DataFrame:
+        """Grid-search ctc_weight and length_penalty on a validation dataloader by CER."""
+        rows = []
+        for w in ctc_weights:
+            for a in length_penalties:
+                cfg = {'num_batches': num_batches, 'beam_width': beam_width, 'temperature': 1.0,
+                       'repeat_penalty': 1.0, 'ctc_weight': w, 'length_penalty': a}
+                results = self.recognize(dataloader, cfg, f'beam{beam_width}_ctc{w}_lp{a}')
+                m = self._calculate_asr_metrics([r['target'] for r in results],
+                                                [r['generated'] for r in results])
+                rows.append({'ctc_weight': w, 'length_penalty': a, 'cer': m['cer'], 'wer': m['wer']})
+                print(rows[-1])
+        return pd.DataFrame(rows).sort_values('cer')
+
 # -------------------------------------------------------------------------------------------------
 
 class ProgressiveTrainer(ASRTrainer):
