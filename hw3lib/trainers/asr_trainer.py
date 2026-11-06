@@ -500,8 +500,8 @@ class ASRTrainer(BaseTrainer):
         beam_20_config = common_config.copy()
         beam_20_config.update({
             'beam_width': 20,
-            'ctc_weight': 0.3,
-            'length_penalty': 0.6,
+            'ctc_weight': 0.2,
+            'length_penalty': 1.0,
         })
         
         return {
