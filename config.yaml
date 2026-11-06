@@ -61,7 +61,7 @@ model: # Encoder-Decoder Transformer (HW3P2)
 ###### Common Training Parameters ------------------------------------------------
 training:
   use_wandb                   : True   # Toggle wandb logging
-  wandb_run_id                : "none" # Run ID from the run's URL, not its name. "none" starts fresh
+  wandb_run_id                : "ds7k2nba" # Run ID from the run's URL, not its name. "none" starts fresh
   gradient_accumulation_steps : 1
   wandb_project               : "hw3p2" # wandb project to log to
 
